@@ -2,14 +2,21 @@
 //!
 //! The output mirrors the layout the reader supports: an `XISF0100` preamble,
 //! a UTF-8 XML header padded to a 4096-byte block boundary, and one attached
-//! uncompressed little-endian `Float32` planar data block. FITS-compatible
-//! metadata is stored as `FITSKeyword` elements whose values use FITS text
-//! conventions, so files round-trip through this crate's reader and load in
-//! PixInsight.
+//! little-endian `Float32` planar data block, optionally compressed and
+//! checksummed. FITS-compatible metadata is stored as `FITSKeyword` elements
+//! whose values use FITS text conventions, so files round-trip through this
+//! crate's reader and load in PixInsight.
 
-use crate::{MAX_HEADER_BYTES, MAX_SAMPLES, SIGNATURE, XisfError};
+use crate::metadata::{ENCODING_PROPERTIES, PIXEL_ATTRIBUTES, SOURCE_ATTRIBUTES};
+use crate::xml::escape_attribute;
+use crate::{
+    CompressionCodec, MAX_HEADER_BYTES, MAX_SAMPLES, SIGNATURE, XisfElement, XisfError,
+    XisfMetadata,
+};
 use quick_xml::escape::escape;
 use seiza_fits::{F32ImageData, HeaderValue, WriteHeaderCard};
+use sha2::digest::DynDigest;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io::{BufWriter, Write};
@@ -17,6 +24,114 @@ use std::path::Path;
 
 const BLOCK_ALIGNMENT: usize = 4096;
 const PIXEL_CHUNK_BYTES: usize = 1024 * 1024;
+/// The largest block compressed as one unit. Larger blocks are split into
+/// subblocks, which keeps every codec within its input limit.
+const SUBBLOCK_BYTES: usize = 1 << 30;
+
+/// Choices for [`write_f32_image_with_options`].
+///
+/// The default writes an uncompressed block without a checksum, which every
+/// XISF reader can open.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WriteOptions<'a> {
+    pub compression: Option<WriteCompression>,
+    /// Hash the stored pixel block so readers can detect corruption.
+    pub checksum: Option<ChecksumAlgorithm>,
+    /// Metadata read from a file, such as [`XisfImage::metadata`], to write
+    /// back out along with the new pixels. See [`XisfMetadata`] for what the
+    /// writer leaves out.
+    ///
+    /// [`XisfImage::metadata`]: crate::XisfImage::metadata
+    pub metadata: Option<&'a XisfMetadata>,
+    /// The representable range to declare, as `(low, high)`. By default the
+    /// writer declares the range the samples span.
+    ///
+    /// Readers such as PixInsight map this range onto their display range
+    /// when they load the file, so declare the range the samples are meant
+    /// to have: `(0.0, 1.0)` for normalized samples, `(0.0, 65535.0)` for
+    /// 16-bit camera counts.
+    pub bounds: Option<(f64, f64)>,
+}
+
+/// How to compress the pixel block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteCompression {
+    /// [`CompressionCodec::Lz4Hc`] is not available for writing.
+    pub codec: CompressionCodec,
+    /// Group the bytes of equal significance before compressing, which
+    /// usually compresses floating-point pixels much better.
+    pub byte_shuffle: bool,
+    /// The codec's own level: 0 to 9 for zlib, 1 to 22 for zstd, and none
+    /// for LZ4. `None` picks the codec's default.
+    pub level: Option<i32>,
+}
+
+impl WriteCompression {
+    /// Zstandard with byte shuffling at its default level, the codec the
+    /// XISF specification recommends for pixel data.
+    ///
+    /// Readers built on the original 2017 specification cannot decode
+    /// Zstandard; use zlib or LZ4 when they must open the file.
+    pub fn recommended() -> Self {
+        Self {
+            codec: CompressionCodec::Zstd,
+            byte_shuffle: true,
+            level: None,
+        }
+    }
+}
+
+/// A hashing algorithm for data block checksums.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChecksumAlgorithm {
+    Sha1,
+    Sha256,
+    Sha512,
+    Sha3_256,
+    Sha3_512,
+}
+
+impl ChecksumAlgorithm {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sha1 => "sha-1",
+            Self::Sha256 => "sha-256",
+            Self::Sha512 => "sha-512",
+            Self::Sha3_256 => "sha3-256",
+            Self::Sha3_512 => "sha3-512",
+        }
+    }
+
+    fn hasher(self) -> Box<dyn DynDigest> {
+        match self {
+            Self::Sha1 => Box::new(sha1::Sha1::default()),
+            Self::Sha256 => Box::new(sha2::Sha256::default()),
+            Self::Sha512 => Box::new(sha2::Sha512::default()),
+            Self::Sha3_256 => Box::new(sha3::Sha3_256::default()),
+            Self::Sha3_512 => Box::new(sha3::Sha3_512::default()),
+        }
+    }
+
+    fn digest(self, bytes: &[u8]) -> String {
+        let mut hasher = self.hasher();
+        hasher.update(bytes);
+        crate::lowercase_hex(&hasher.finalize())
+    }
+}
+
+/// A `Write` sink that hashes what it is given.
+struct HashWriter(Box<dyn DynDigest>);
+
+impl Write for HashWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Atomically write a one-image monolithic XISF file with `Float32` samples.
 ///
@@ -30,7 +145,27 @@ pub fn write_f32_image(
     pixels: F32ImageData<'_>,
     headers: &[WriteHeaderCard],
 ) -> Result<(), XisfError> {
+    write_f32_image_with_options(
+        path,
+        width,
+        height,
+        pixels,
+        headers,
+        &WriteOptions::default(),
+    )
+}
+
+/// [`write_f32_image`] with compression and checksum choices.
+pub fn write_f32_image_with_options(
+    path: impl AsRef<Path>,
+    width: usize,
+    height: usize,
+    pixels: F32ImageData<'_>,
+    headers: &[WriteHeaderCard],
+    options: &WriteOptions<'_>,
+) -> Result<(), XisfError> {
     validate_image(width, height, pixels, headers)?;
+    validate_options(options)?;
     let path = path.as_ref();
     let parent = path
         .parent()
@@ -52,7 +187,7 @@ pub fn write_f32_image(
     }
     let mut temporary = builder.tempfile_in(parent)?;
     let mut writer = BufWriter::new(temporary.as_file_mut());
-    write_f32_image_to(&mut writer, width, height, pixels, headers)?;
+    write_f32_image_to_with_options(&mut writer, width, height, pixels, headers, options)?;
     writer.flush()?;
     drop(writer);
     temporary.as_file().sync_all()?;
@@ -65,26 +200,66 @@ pub fn write_f32_image(
 /// The caller owns flushing and durability. Prefer [`write_f32_image`] for an
 /// atomic on-disk file.
 pub fn write_f32_image_to(
-    mut writer: impl Write,
+    writer: impl Write,
     width: usize,
     height: usize,
     pixels: F32ImageData<'_>,
     headers: &[WriteHeaderCard],
 ) -> Result<(), XisfError> {
-    validate_image(width, height, pixels, headers)?;
-    let data_bytes = std::mem::size_of_val(pixels.samples());
-    let bounds = sample_bounds(pixels.samples());
+    write_f32_image_to_with_options(
+        writer,
+        width,
+        height,
+        pixels,
+        headers,
+        &WriteOptions::default(),
+    )
+}
 
+/// [`write_f32_image_to`] with compression and checksum choices.
+pub fn write_f32_image_to_with_options(
+    writer: impl Write,
+    width: usize,
+    height: usize,
+    pixels: F32ImageData<'_>,
+    headers: &[WriteHeaderCard],
+    options: &WriteOptions<'_>,
+) -> Result<(), XisfError> {
+    write_image(
+        writer,
+        (width, height, pixels),
+        headers,
+        options,
+        SUBBLOCK_BYTES,
+    )
+}
+
+fn write_image(
+    mut writer: impl Write,
+    (width, height, pixels): (usize, usize, F32ImageData<'_>),
+    headers: &[WriteHeaderCard],
+    options: &WriteOptions<'_>,
+    subblock_bytes: usize,
+) -> Result<(), XisfError> {
+    validate_image(width, height, pixels, headers)?;
+    validate_options(options)?;
+    let block = prepare_block(width, height, pixels, options, subblock_bytes)?;
+    let bounds = options.bounds.unwrap_or_else(|| {
+        let (low, high) = sample_bounds(pixels.samples());
+        (f64::from(low), f64::from(high))
+    });
+    let carried = Carried::new(options.metadata, (width, height, pixels.planes()), headers);
+
+    let created = utc_timestamp(std::time::SystemTime::now());
     let mut data_offset = BLOCK_ALIGNMENT;
     let xml = loop {
         let xml = render_xml(
-            width,
-            height,
-            pixels,
+            (width, height, pixels),
             headers,
             bounds,
-            data_offset,
-            data_bytes,
+            (data_offset, &block),
+            &carried,
+            &created,
         );
         let end = PREAMBLE_LEN + xml.len();
         let needed = end.div_ceil(BLOCK_ALIGNMENT) * BLOCK_ALIGNMENT;
@@ -106,6 +281,27 @@ pub fn write_f32_image_to(
     writer.write_all(xml.as_bytes())?;
     writer.write_all(&vec![b' '; data_offset - PREAMBLE_LEN - xml.len()])?;
 
+    if let Some(stored) = &block.stored {
+        writer.write_all(stored)?;
+    } else {
+        write_samples(&mut writer, width, height, pixels)?;
+    }
+    let mut position = data_offset + block.bytes;
+    for bytes in carried.blocks() {
+        let aligned = position.next_multiple_of(BLOCK_ALIGNMENT);
+        writer.write_all(&vec![0; aligned - position])?;
+        writer.write_all(bytes)?;
+        position = aligned + bytes.len();
+    }
+    Ok(())
+}
+
+fn write_samples(
+    mut writer: impl Write,
+    width: usize,
+    height: usize,
+    pixels: F32ImageData<'_>,
+) -> Result<(), XisfError> {
     let mut byte_buffer = Vec::with_capacity(PIXEL_CHUNK_BYTES);
     match pixels {
         F32ImageData::Mono(samples) | F32ImageData::RgbPlanar(samples) => {
@@ -125,56 +321,550 @@ pub fn write_f32_image_to(
     Ok(())
 }
 
-const PREAMBLE_LEN: usize = 16;
+/// The metadata carried from a read into this write, less what the new
+/// pixels make false.
+#[derive(Default)]
+struct Carried {
+    image_attributes: Vec<(String, String)>,
+    image_elements: Vec<XisfElement>,
+    unit_properties: Vec<XisfElement>,
+    root_elements: Vec<XisfElement>,
+    root_attributes: Vec<(String, String)>,
+    /// The source's creation time, to record as `XISF:OriginalCreationTime`.
+    original_creation_time: Option<String>,
+    /// The codec identifiers of the carried blocks, such as `zstd+sh`.
+    codecs: BTreeSet<String>,
+    /// The checksum algorithms of the carried blocks.
+    checksums: BTreeSet<String>,
+}
 
-fn render_xml(
+impl Carried {
+    fn new(
+        metadata: Option<&XisfMetadata>,
+        (width, height, planes): (usize, usize, usize),
+        headers: &[WriteHeaderCard],
+    ) -> Self {
+        let Some(metadata) = metadata else {
+            return Self::default();
+        };
+        let (source_width, source_height, source_planes) = metadata.source_geometry;
+        let resized = (width, height) != (source_width, source_height);
+        let replanned = planes != source_planes;
+        let image_elements = metadata
+            .image_elements
+            .iter()
+            .filter(|element| match element.local_name() {
+                "FITSKeyword" => element.attribute("name").is_some_and(|name| {
+                    let name = name.trim();
+                    // Scaling and structure cards describe the old samples,
+                    // and the caller's cards replace carried ones of the same
+                    // name, except commentary cards, which add to them.
+                    !is_structural_keyword(name)
+                        && (is_commentary_keyword(name)
+                            || !headers.iter().any(|header| header.keyword() == name))
+                        && !(resized && is_wcs_keyword(name))
+                        && !(replanned && is_bayer_keyword(name))
+                }),
+                // A solution describes the old geometry; the specification
+                // requires dropping it when the geometry changes.
+                "Property" => {
+                    !(resized
+                        && element.attribute("id").is_some_and(|id| {
+                            id.starts_with("AstrometricSolution:")
+                                || id.starts_with("PCL:AstrometricSolution:")
+                        }))
+                }
+                "ColorFilterArray" => !replanned,
+                _ => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let property_id =
+            |element: &XisfElement| element.attribute("id").unwrap_or("").trim().to_string();
+        let original_creation_time = metadata
+            .unit_properties
+            .iter()
+            .find(|element| property_id(element) == "XISF:OriginalCreationTime")
+            .or_else(|| {
+                metadata
+                    .unit_properties
+                    .iter()
+                    .find(|element| property_id(element) == "XISF:CreationTime")
+            })
+            // PixInsight writes the time as String text rather than a
+            // TimePoint value attribute.
+            .and_then(|element| {
+                element
+                    .attribute("value")
+                    .or(Some(element.text.as_str()))
+                    .map(str::trim)
+                    .filter(|time| !time.is_empty())
+            })
+            .map(str::to_string);
+        let unit_properties = metadata
+            .unit_properties
+            .iter()
+            .filter(|element| {
+                let id = property_id(element);
+                !ENCODING_PROPERTIES.contains(&id.as_str()) && id != "XISF:OriginalCreationTime"
+            })
+            .cloned()
+            .collect();
+        Self {
+            image_attributes: metadata
+                .image_attributes
+                .iter()
+                .filter(|(name, _)| {
+                    !PIXEL_ATTRIBUTES.contains(&name.as_str())
+                        && !SOURCE_ATTRIBUTES.contains(&name.as_str())
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            codecs: BTreeSet::new(),
+            checksums: BTreeSet::new(),
+            image_elements,
+            unit_properties,
+            root_elements: metadata.root_elements.clone(),
+            root_attributes: metadata
+                .root_attributes
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            original_creation_time,
+        }
+        .with_block_encodings()
+    }
+
+    /// Record the codecs and checksum algorithms of every carried block,
+    /// wherever it is stored.
+    fn with_block_encodings(mut self) -> Self {
+        fn visit(
+            element: &XisfElement,
+            codecs: &mut BTreeSet<String>,
+            checksums: &mut BTreeSet<String>,
+        ) {
+            let first = |value: &str| value.split(':').next().unwrap_or("").trim().to_string();
+            if let Some(compression) = element.attribute("compression") {
+                codecs.insert(first(compression));
+            }
+            if let Some(checksum) = element.attribute("checksum") {
+                checksums.insert(first(checksum));
+            }
+            for child in &element.children {
+                visit(child, codecs, checksums);
+            }
+        }
+        let (mut codecs, mut checksums) = (BTreeSet::new(), BTreeSet::new());
+        for element in self
+            .image_elements
+            .iter()
+            .chain(&self.unit_properties)
+            .chain(&self.root_elements)
+        {
+            visit(element, &mut codecs, &mut checksums);
+        }
+        self.codecs = codecs;
+        self.checksums = checksums;
+        self
+    }
+
+    /// The loaded blocks of the carried elements, in document order.
+    fn blocks(&self) -> Vec<&[u8]> {
+        fn collect<'e>(element: &'e XisfElement, blocks: &mut Vec<&'e [u8]>) {
+            if let Some(block) = &element.block {
+                blocks.push(block);
+            }
+            for child in &element.children {
+                collect(child, blocks);
+            }
+        }
+        let mut blocks = Vec::new();
+        for element in self
+            .image_elements
+            .iter()
+            .chain(&self.unit_properties)
+            .chain(&self.root_elements)
+        {
+            collect(element, &mut blocks);
+        }
+        blocks
+    }
+}
+
+/// The pixel block as it will be stored, with the `Image` attributes and
+/// `Metadata` properties that describe it.
+struct PreparedBlock {
+    /// The stored bytes, or `None` to stream the samples uncompressed.
+    stored: Option<Vec<u8>>,
+    bytes: usize,
+    attributes: String,
+    /// The codec identifier, such as `zstd+sh`, when the block is compressed.
+    codec: Option<String>,
+    /// The abstract compression level of `codec`.
+    level: Option<i32>,
+    checksum: Option<ChecksumAlgorithm>,
+}
+
+fn validate_options(options: &WriteOptions<'_>) -> Result<(), XisfError> {
+    if let Some((low, high)) = options.bounds
+        && !(low.is_finite() && high.is_finite() && low < high)
+    {
+        return Err(XisfError::Malformed(format!(
+            "bounds {low}:{high} do not describe a range"
+        )));
+    }
+    let Some(compression) = options.compression else {
+        return Ok(());
+    };
+    let level_range = match compression.codec {
+        CompressionCodec::Zlib => Some(0..=9),
+        CompressionCodec::Zstd => Some(1..=22),
+        CompressionCodec::Lz4 => None,
+        CompressionCodec::Lz4Hc => {
+            return Err(XisfError::Unsupported(
+                "LZ4HC compression is not available for writing".into(),
+            ));
+        }
+    };
+    match (compression.level, level_range) {
+        (None, _) => Ok(()),
+        (Some(level), Some(range)) if range.contains(&level) => Ok(()),
+        (Some(level), _) => Err(XisfError::Malformed(format!(
+            "compression level {level} is outside the range of {:?}",
+            compression.codec
+        ))),
+    }
+}
+
+fn prepare_block(
     width: usize,
     height: usize,
     pixels: F32ImageData<'_>,
+    options: &WriteOptions<'_>,
+    subblock_bytes: usize,
+) -> Result<PreparedBlock, XisfError> {
+    let mut block = PreparedBlock {
+        stored: None,
+        bytes: std::mem::size_of_val(pixels.samples()),
+        attributes: String::new(),
+        codec: None,
+        level: None,
+        checksum: options.checksum,
+    };
+    if let Some(compression) = options.compression {
+        let mut raw = Vec::with_capacity(block.bytes);
+        write_samples(&mut raw, width, height, pixels)?;
+        let item_bytes = std::mem::size_of::<f32>();
+        let shuffled;
+        let input = if compression.byte_shuffle {
+            shuffled = shuffle(&raw, item_bytes);
+            &shuffled
+        } else {
+            &raw
+        };
+        let subblocks = input
+            .chunks(subblock_bytes)
+            .map(|chunk| {
+                // As PixInsight does, a subblock that would not shrink is
+                // stored as it is; readers copy a subblock whose stored and
+                // uncompressed lengths are equal.
+                let compressed = compress(chunk, compression);
+                let stored = if compressed.len() >= chunk.len() {
+                    chunk.to_vec()
+                } else {
+                    compressed
+                };
+                (stored, chunk.len())
+            })
+            .collect::<Vec<_>>();
+        let compressed_bytes = subblocks.iter().map(|(data, _)| data.len()).sum::<usize>();
+        // A block that does not shrink is stored as it is.
+        if compressed_bytes < raw.len() {
+            let name = codec_name(compression.codec);
+            let codec = if compression.byte_shuffle {
+                format!("{name}+sh")
+            } else {
+                name.to_string()
+            };
+            let _ = write!(block.attributes, " compression=\"{codec}:{}", raw.len());
+            if compression.byte_shuffle {
+                let _ = write!(block.attributes, ":{item_bytes}");
+            }
+            block.attributes.push('"');
+            if subblocks.len() > 1 {
+                let list = subblocks
+                    .iter()
+                    .map(|(data, uncompressed)| format!("{},{uncompressed}", data.len()))
+                    .collect::<Vec<_>>()
+                    .join(":");
+                let _ = write!(block.attributes, " subblocks=\"{list}\"");
+            }
+            block.codec = Some(codec);
+            block.level = abstract_compression_level(compression);
+            drop(raw);
+            block.stored = Some(subblocks.into_iter().flat_map(|(data, _)| data).collect());
+        } else {
+            block.stored = Some(raw);
+        }
+    }
+    if let Some(checksum) = options.checksum {
+        let digest = match &block.stored {
+            Some(stored) => checksum.digest(stored),
+            // Uncompressed samples are hashed as they stream, rather than
+            // gathered into one buffer.
+            None => {
+                let mut hasher = HashWriter(checksum.hasher());
+                write_samples(&mut hasher, width, height, pixels)?;
+                crate::lowercase_hex(&hasher.0.finalize())
+            }
+        };
+        let _ = write!(
+            block.attributes,
+            " checksum=\"{}:{digest}\"",
+            checksum.name()
+        );
+    }
+    if let Some(stored) = &block.stored {
+        block.bytes = stored.len();
+    }
+    Ok(block)
+}
+
+fn codec_name(codec: CompressionCodec) -> &'static str {
+    match codec {
+        CompressionCodec::Zlib => "zlib",
+        CompressionCodec::Lz4 => "lz4",
+        CompressionCodec::Lz4Hc => "lz4hc",
+        CompressionCodec::Zstd => "zstd",
+    }
+}
+
+const DEFAULT_ZLIB_LEVEL: i32 = 6;
+const DEFAULT_ZSTD_LEVEL: i32 = 3;
+
+fn compress(chunk: &[u8], compression: WriteCompression) -> Vec<u8> {
+    match compression.codec {
+        CompressionCodec::Zlib => {
+            let level = compression.level.unwrap_or(DEFAULT_ZLIB_LEVEL) as u32;
+            let mut encoder = flate2::write::ZlibEncoder::new(
+                Vec::with_capacity(chunk.len() / 2),
+                flate2::Compression::new(level),
+            );
+            encoder
+                .write_all(chunk)
+                .and_then(|()| encoder.finish())
+                .expect("compressing into memory cannot fail")
+        }
+        CompressionCodec::Zstd => {
+            let level = compression.level.unwrap_or(DEFAULT_ZSTD_LEVEL);
+            zstd::bulk::compress(chunk, level).expect("compressing into memory cannot fail")
+        }
+        CompressionCodec::Lz4 | CompressionCodec::Lz4Hc => lz4_flex::block::compress(chunk),
+    }
+}
+
+/// The codec-independent `XISF:CompressionLevel`: the codec's level range
+/// mapped linearly onto 1 to 100.
+fn abstract_compression_level(compression: WriteCompression) -> Option<i32> {
+    let (level, low, high) = match compression.codec {
+        CompressionCodec::Zlib => (compression.level.unwrap_or(DEFAULT_ZLIB_LEVEL), 0, 9),
+        CompressionCodec::Zstd => (compression.level.unwrap_or(DEFAULT_ZSTD_LEVEL), 1, 22),
+        CompressionCodec::Lz4 | CompressionCodec::Lz4Hc => return None,
+    };
+    Some(1 + ((level - low) * 99 + (high - low) / 2) / (high - low))
+}
+
+/// The XISF byte shuffle: all first bytes of each item, then all second
+/// bytes, and so on. Trailing bytes that do not form a whole item stay last.
+fn shuffle(bytes: &[u8], item_bytes: usize) -> Vec<u8> {
+    let items = bytes.len() / item_bytes;
+    let mut output = Vec::with_capacity(bytes.len());
+    for lane in 0..item_bytes {
+        output.extend((0..items).map(|item| bytes[item * item_bytes + lane]));
+    }
+    output.extend_from_slice(&bytes[items * item_bytes..]);
+    output
+}
+
+/// The `XISF:CreatorOS` value for the operating system this build targets.
+fn creator_os() -> Option<&'static str> {
+    if cfg!(target_os = "linux") {
+        Some("Linux")
+    } else if cfg!(target_os = "macos") {
+        Some("macOS")
+    } else if cfg!(target_os = "windows") {
+        Some("Windows")
+    } else if cfg!(target_os = "freebsd") {
+        Some("FreeBSD")
+    } else {
+        None
+    }
+}
+
+const PREAMBLE_LEN: usize = 16;
+
+fn render_xml(
+    (width, height, pixels): (usize, usize, F32ImageData<'_>),
     headers: &[WriteHeaderCard],
-    bounds: (f32, f32),
-    data_offset: usize,
-    data_bytes: usize,
+    bounds: (f64, f64),
+    (data_offset, block): (usize, &PreparedBlock),
+    carried: &Carried,
+    created: &str,
 ) -> String {
     let planes = pixels.planes();
     let color_space = if planes == 3 { "RGB" } else { "Gray" };
+    // Carried blocks follow the pixel block, in document order.
+    let mut position = data_offset + block.bytes;
+    let mut locations = carried
+        .blocks()
+        .into_iter()
+        .map(|bytes| {
+            // Every attached block starts at a multiple of the declared
+            // XISF:BlockAlignmentSize.
+            position = position.next_multiple_of(BLOCK_ALIGNMENT);
+            let location = format!("attachment:{position}:{}", bytes.len());
+            position += bytes.len();
+            location
+        })
+        .collect::<Vec<_>>()
+        .into_iter();
     let mut xml = String::with_capacity(1024);
     xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
     xml.push_str(
         "<xisf version=\"1.0\" xmlns=\"http://www.pixinsight.com/xisf\" \
          xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
          xsi:schemaLocation=\"http://www.pixinsight.com/xisf \
-         http://pixinsight.com/xisf/xisf-1.0.xsd\">",
+         http://pixinsight.com/xisf/xisf-1.0.xsd\"",
     );
+    for (name, value) in &carried.root_attributes {
+        let _ = write!(xml, " {name}=\"{}\"", escape_attribute(value));
+    }
+    xml.push('>');
     let _ = write!(
         xml,
         "<Image geometry=\"{width}:{height}:{planes}\" sampleFormat=\"Float32\" \
          bounds=\"{}:{}\" colorSpace=\"{color_space}\" pixelStorage=\"Planar\" \
-         location=\"attachment:{data_offset}:{data_bytes}\">",
-        bounds.0, bounds.1
+         location=\"attachment:{data_offset}:{}\"{}",
+        bounds.0, bounds.1, block.bytes, block.attributes
     );
+    for (name, value) in &carried.image_attributes {
+        let _ = write!(xml, " {name}=\"{}\"", escape_attribute(value));
+    }
+    xml.push('>');
+    for element in &carried.image_elements {
+        element.write(&mut xml, &mut locations);
+    }
     for header in headers {
+        // name, value and comment are all mandatory attributes.
         let _ = write!(
             xml,
-            "<FITSKeyword name=\"{}\" value=\"{}\"",
-            escape(header.keyword()),
-            escape(fits_value_text(header.value()))
+            "<FITSKeyword name=\"{}\" value=\"{}\" comment=\"{}\"/>",
+            escape_attribute(header.keyword()),
+            escape_attribute(&fits_value_text(header.value())),
+            escape_attribute(header.comment())
         );
-        if header.comment().is_empty() {
-            xml.push_str("/>");
-        } else {
-            let _ = write!(xml, " comment=\"{}\"/>", escape(header.comment()));
-        }
     }
     xml.push_str("</Image>");
     let _ = write!(
         xml,
-        "<Metadata><Property id=\"XISF:CreatorApplication\" type=\"String\">seiza-xisf {}\
-         </Property></Metadata>",
+        "<Metadata><Property id=\"XISF:CreationTime\" type=\"TimePoint\" value=\"{created}\"/>\
+         <Property id=\"XISF:CreatorApplication\" type=\"String\">seiza-xisf {}</Property>",
         env!("CARGO_PKG_VERSION")
     );
+    if let Some(os) = creator_os() {
+        let _ = write!(
+            xml,
+            "<Property id=\"XISF:CreatorOS\" type=\"String\">{os}</Property>"
+        );
+    }
+    let _ = write!(
+        xml,
+        "<Property id=\"XISF:BlockAlignmentSize\" type=\"UInt16\" value=\"{BLOCK_ALIGNMENT}\"/>"
+    );
+    // The codecs and checksum algorithms of every block in the unit, the
+    // carried ones included.
+    let codecs = block
+        .codec
+        .iter()
+        .cloned()
+        .chain(carried.codecs.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if !codecs.is_empty() {
+        let list = codecs.into_iter().collect::<Vec<_>>().join(",");
+        let _ = write!(
+            xml,
+            "<Property id=\"XISF:CompressionCodecs\" type=\"String\">{}</Property>",
+            escape(list.as_str())
+        );
+    }
+    // One level only describes the unit when the pixel block is its only
+    // compressed block.
+    if let Some(level) = block.level.filter(|_| carried.codecs.is_empty()) {
+        let _ = write!(
+            xml,
+            "<Property id=\"XISF:CompressionLevel\" type=\"Int32\" value=\"{level}\"/>"
+        );
+    }
+    let checksums = block
+        .checksum
+        .map(|checksum| checksum.name().to_string())
+        .into_iter()
+        .chain(carried.checksums.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if !checksums.is_empty() {
+        let list = checksums.into_iter().collect::<Vec<_>>().join(",");
+        let _ = write!(
+            xml,
+            "<Property id=\"XISF:ChecksumAlgorithms\" type=\"String\">{}</Property>",
+            escape(list.as_str())
+        );
+    }
+    if let Some(time) = &carried.original_creation_time {
+        let _ = write!(
+            xml,
+            "<Property id=\"XISF:OriginalCreationTime\" type=\"TimePoint\" value=\"{}\"/>",
+            escape_attribute(time)
+        );
+    }
+    for element in &carried.unit_properties {
+        element.write(&mut xml, &mut locations);
+    }
+    xml.push_str("</Metadata>");
+    for element in &carried.root_elements {
+        element.write(&mut xml, &mut locations);
+    }
     xml.push_str("</xisf>");
     xml
+}
+
+/// Format a time as an ISO 8601 UTC timestamp, such as `2026-09-28T05:02:40Z`.
+fn utc_timestamp(time: std::time::SystemTime) -> String {
+    let seconds = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let (days, second_of_day) = (seconds / 86_400, seconds % 86_400);
+    // Civil date from days since 1970-01-01, after Howard Hinnant's
+    // days_from_civil inverse, in 400-year eras starting on March 1.
+    let days = days + 719_468;
+    let era = days / 146_097;
+    let day_of_era = days % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        second_of_day / 3_600,
+        second_of_day / 60 % 60,
+        second_of_day % 60
+    )
 }
 
 /// Serialize a header value with FITS text conventions so the reader's
@@ -236,7 +926,7 @@ fn validate_image(
                 header.keyword()
             )));
         }
-        if !keywords.insert(header.keyword()) {
+        if !is_commentary_keyword(header.keyword()) && !keywords.insert(header.keyword()) {
             return Err(XisfError::Malformed(format!(
                 "duplicate FITS header {}",
                 header.keyword()
@@ -266,6 +956,58 @@ fn validate_keyword(keyword: &str) -> Result<(), XisfError> {
         )));
     }
     Ok(())
+}
+
+/// Keywords that may repeat, each card adding a line.
+fn is_commentary_keyword(keyword: &str) -> bool {
+    matches!(keyword, "HISTORY" | "COMMENT" | "")
+}
+
+/// FITS World Coordinate System keywords, including alternate descriptions
+/// (a trailing letter) and SIP distortion coefficients.
+fn is_wcs_keyword(keyword: &str) -> bool {
+    let keyword = keyword.to_ascii_uppercase();
+    let base = keyword
+        .strip_suffix(|last: char| last.is_ascii_uppercase())
+        .filter(|base| base.ends_with(|last: char| last.is_ascii_digit()))
+        .unwrap_or(&keyword);
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    let indexed = [
+        "CRPIX", "CRVAL", "CDELT", "CROTA", "CTYPE", "CUNIT", "CRDER", "CSYER",
+    ]
+    .iter()
+    .any(|prefix| base.strip_prefix(prefix).is_some_and(digits));
+    let matrix = ["CD", "PC", "PV", "PS", "A_", "B_", "AP_", "BP_"]
+        .iter()
+        .any(|prefix| {
+            base.strip_prefix(prefix)
+                .and_then(|rest| rest.split_once('_'))
+                .is_some_and(|(row, column)| digits(row) && digits(column))
+        });
+    indexed
+        || matrix
+        || matches!(
+            base,
+            "LONPOLE"
+                | "LATPOLE"
+                | "WCSAXES"
+                | "WCSNAME"
+                | "A_ORDER"
+                | "B_ORDER"
+                | "AP_ORDER"
+                | "BP_ORDER"
+                | "A_DMAX"
+                | "B_DMAX"
+                | "PLTSOLVD"
+        )
+}
+
+/// Keywords that describe a color filter array mosaic.
+fn is_bayer_keyword(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "BAYERPAT" | "XBAYROFF" | "YBAYROFF" | "BAYOFFX" | "BAYOFFY" | "COLORTYP"
+    )
 }
 
 fn is_structural_keyword(keyword: &str) -> bool {
@@ -311,6 +1053,212 @@ fn write_float_values(
 mod tests {
     use super::*;
     use seiza_fits::Pixels;
+
+    fn smooth_rgb(width: usize, height: usize) -> Vec<f32> {
+        (0..width * height * 3)
+            .map(|index| 0.25 + (index % 97) as f32 / 1000.0)
+            .collect()
+    }
+
+    fn write_to_memory(
+        values: &[f32],
+        options: &WriteOptions<'_>,
+        subblock_bytes: usize,
+    ) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        write_image(
+            &mut encoded,
+            (16, 8, F32ImageData::RgbInterleaved(values)),
+            &[],
+            options,
+            subblock_bytes,
+        )
+        .unwrap();
+        encoded
+    }
+
+    fn planar_from(values: &[f32], pixels: usize) -> Vec<f32> {
+        (0..3)
+            .flat_map(|channel| (0..pixels).map(move |index| values[index * 3 + channel]))
+            .collect()
+    }
+
+    #[test]
+    fn compressed_and_checksummed_files_round_trip() {
+        let values = smooth_rgb(16, 8);
+        let expected = planar_from(&values, 16 * 8);
+        let checksums = [
+            ChecksumAlgorithm::Sha1,
+            ChecksumAlgorithm::Sha256,
+            ChecksumAlgorithm::Sha512,
+            ChecksumAlgorithm::Sha3_256,
+            ChecksumAlgorithm::Sha3_512,
+        ];
+        let mut cases = Vec::new();
+        for codec in [
+            CompressionCodec::Zlib,
+            CompressionCodec::Lz4,
+            CompressionCodec::Zstd,
+        ] {
+            for byte_shuffle in [false, true] {
+                cases.push(Some(WriteCompression {
+                    codec,
+                    byte_shuffle,
+                    level: None,
+                }));
+            }
+        }
+        cases.push(None);
+        for (case, compression) in cases.into_iter().enumerate() {
+            for subblock_bytes in [SUBBLOCK_BYTES, 500] {
+                let options = WriteOptions {
+                    compression,
+                    checksum: Some(checksums[case % checksums.len()]),
+                    metadata: None,
+                    bounds: None,
+                };
+                let encoded = write_to_memory(&values, &options, subblock_bytes);
+                let read = crate::read_image_from_bytes(&encoded, 0).unwrap();
+                let Pixels::F32(actual) = &read.image.pixels else {
+                    panic!("writer must emit f32 pixels");
+                };
+                assert_eq!(actual, &expected, "{options:?}");
+                if let Some(compression) = compression {
+                    let info = read.info.compression.expect("block must be compressed");
+                    assert_eq!(info.codec, compression.codec);
+                    assert_eq!(info.shuffled_item_bytes.is_some(), compression.byte_shuffle);
+                    assert_eq!(info.subblocks.len() > 1, subblock_bytes == 500);
+                }
+                let header = String::from_utf8_lossy(&encoded[..4096]);
+                assert!(header.contains("XISF:ChecksumAlgorithms"));
+                assert_eq!(
+                    header.contains("XISF:CompressionCodecs"),
+                    compression.is_some()
+                );
+
+                // A flipped stored byte must fail verification before decoding.
+                let mut corrupt = encoded.clone();
+                let last = corrupt.len() - 1;
+                corrupt[last] ^= 0x55;
+                assert!(matches!(
+                    crate::from_bytes(&corrupt),
+                    Err(XisfError::Malformed(message)) if message.contains("checksum mismatch")
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn stores_a_block_that_does_not_shrink_uncompressed() {
+        // Pseudo-random bits leave nothing for LZ4 to find.
+        let mut state = 0x9e37_79b9_u32;
+        let values = (0..16 * 8 * 3)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                f32::from_bits(state & 0x3fff_ffff)
+            })
+            .collect::<Vec<_>>();
+        let options = WriteOptions {
+            compression: Some(WriteCompression {
+                codec: CompressionCodec::Lz4,
+                byte_shuffle: false,
+                level: None,
+            }),
+            checksum: None,
+            metadata: None,
+            bounds: None,
+        };
+        let encoded = write_to_memory(&values, &options, SUBBLOCK_BYTES);
+        let read = crate::read_image_from_bytes(&encoded, 0).unwrap();
+        assert!(read.info.compression.is_none());
+        assert!(!String::from_utf8_lossy(&encoded[..4096]).contains("CompressionCodecs"));
+    }
+
+    #[test]
+    fn rejects_unavailable_codecs_and_levels() {
+        let values = smooth_rgb(16, 8);
+        let write = |codec, level| {
+            let options = WriteOptions {
+                compression: Some(WriteCompression {
+                    codec,
+                    byte_shuffle: true,
+                    level,
+                }),
+                checksum: None,
+                metadata: None,
+                bounds: None,
+            };
+            write_image(
+                Vec::new(),
+                (16, 8, F32ImageData::RgbInterleaved(&values)),
+                &[],
+                &options,
+                SUBBLOCK_BYTES,
+            )
+        };
+        assert!(matches!(
+            write(CompressionCodec::Lz4Hc, None),
+            Err(XisfError::Unsupported(_))
+        ));
+        assert!(write(CompressionCodec::Zlib, Some(10)).is_err());
+        assert!(write(CompressionCodec::Zstd, Some(0)).is_err());
+        assert!(write(CompressionCodec::Lz4, Some(1)).is_err());
+        assert!(write(CompressionCodec::Zlib, Some(9)).is_ok());
+        assert!(write(CompressionCodec::Zstd, Some(22)).is_ok());
+    }
+
+    #[test]
+    fn maps_codec_levels_onto_the_abstract_range() {
+        let level = |codec, level| {
+            abstract_compression_level(WriteCompression {
+                codec,
+                byte_shuffle: false,
+                level: Some(level),
+            })
+        };
+        assert_eq!(level(CompressionCodec::Zlib, 0), Some(1));
+        assert_eq!(level(CompressionCodec::Zlib, 9), Some(100));
+        assert_eq!(level(CompressionCodec::Zstd, 1), Some(1));
+        assert_eq!(level(CompressionCodec::Zstd, 22), Some(100));
+        assert_eq!(level(CompressionCodec::Lz4, 0), None);
+    }
+
+    #[test]
+    fn shuffle_matches_the_readers_unshuffle() {
+        let bytes = (0_u8..23).collect::<Vec<_>>();
+        for item_bytes in [1, 2, 4, 8] {
+            assert_eq!(
+                crate::unshuffle(&shuffle(&bytes, item_bytes), item_bytes),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn formats_utc_timestamps() {
+        let at = |seconds| std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+        assert_eq!(utc_timestamp(at(0)), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_timestamp(at(951_782_400)), "2000-02-29T00:00:00Z");
+        assert_eq!(utc_timestamp(at(1_790_571_760)), "2026-09-28T05:02:40Z");
+        assert_eq!(utc_timestamp(at(4_107_542_399)), "2100-02-28T23:59:59Z");
+    }
+
+    #[test]
+    fn writes_the_mandatory_metadata_and_keyword_attributes() {
+        let headers = [WriteHeaderCard::new("EXPTIME", HeaderValue::Float(30.0))];
+        let mut encoded = Vec::new();
+        write_f32_image_to(&mut encoded, 1, 1, F32ImageData::Mono(&[0.5]), &headers).unwrap();
+        let header = String::from_utf8_lossy(&encoded);
+        assert!(header.contains("<Property id=\"XISF:CreationTime\" type=\"TimePoint\" value=\""));
+        assert!(header.contains("<Property id=\"XISF:CreatorApplication\" type=\"String\">"));
+        assert!(
+            header.contains(
+                "<FITSKeyword name=\"EXPTIME\" value=\"3.000000000000E1\" comment=\"\"/>"
+            )
+        );
+    }
 
     #[test]
     fn atomic_mono_writer_round_trips_pixels_and_headers() {
@@ -362,7 +1310,10 @@ mod tests {
         assert_eq!((image.width, image.height, image.planes), (2, 2, 1));
         assert_eq!(image.sample_format, crate::SampleFormat::Float32);
         assert!(image.compression.is_none());
-        assert_eq!(image.attachment_offset % BLOCK_ALIGNMENT as u64, 0);
+        let crate::BlockLocation::Attachment { offset, .. } = image.location else {
+            panic!("writer must attach the pixel block");
+        };
+        assert_eq!(offset % BLOCK_ALIGNMENT as u64, 0);
     }
 
     #[test]
@@ -437,8 +1388,10 @@ mod tests {
         write_f32_image_to(&mut encoded, 3, 2, F32ImageData::Mono(&[0.5; 6]), &headers).unwrap();
 
         let mut cursor = std::io::Cursor::new(encoded.as_slice());
-        let parsed = crate::parse_file(&mut cursor, encoded.len() as u64).unwrap();
-        let offset = parsed.images[0].info.attachment_offset;
+        let parsed = crate::parse_file(&mut cursor, encoded.len() as u64, None).unwrap();
+        let crate::BlockLocation::Attachment { offset, .. } = parsed.images[0].info.location else {
+            panic!("writer must attach the pixel block");
+        };
         assert!(offset > BLOCK_ALIGNMENT as u64);
         assert_eq!(offset % BLOCK_ALIGNMENT as u64, 0);
         let decoded = crate::from_bytes(&encoded).unwrap();
